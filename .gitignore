@@ -1,0 +1,20 @@
+# Environment variables & private secrets (NEVER commit .env)
+.env
+.env.local
+.env.*.local
+
+# Local runtime database files (re-created automatically by server.js)
+supabase/.data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Node dependencies & logs
+node_modules/
+npm-debug.log*
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
