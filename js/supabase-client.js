@@ -43,6 +43,10 @@
       if ((host === 'localhost' || host === '127.0.0.1') && (port === '5500' || port === '5501' || port === '8080')) {
         return `http://${host}:3000`;
       }
+      // If opened on static GitHub Pages (.github.io), connect to the live shared HTTPS backend tunnel
+      if (host.endsWith('.github.io')) {
+        return 'https://215e55eb9436ce.lhr.life';
+      }
       return global.location.origin.replace(/\/+$/, '');
     }
 
