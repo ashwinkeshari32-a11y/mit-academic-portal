@@ -38,6 +38,11 @@
 
   const SUPABASE_URL = resolveSupabaseUrl();
   const SUPABASE_ANON_KEY = resolveSupabaseAnonKey();
+  const IS_STATIC_PAGES_HOST = Boolean(
+    !(global.__SUPABASE_CONFIG__ && global.__SUPABASE_CONFIG__.url) &&
+    global.location &&
+    /\.github\.io$/i.test(String(global.location.hostname || ''))
+  );
 
   // Internal session storage helper (respects Remember Me preference)
   function loadStoredSession() {
@@ -1076,6 +1081,10 @@
     }
 
     async _execute() {
+      if (IS_STATIC_PAGES_HOST) {
+        return executeStaticQuery(this);
+      }
+
       const url = `${SUPABASE_URL}/rest/v1/${this.table}?${this.queryParams.toString()}`;
       const extraHeaders = { Accept: this.acceptHeader };
       if (this.preferHeaders.length > 0) {
@@ -1141,10 +1150,90 @@
     }
   }
 
+  function resolveStaticLoginEmail(params = {}) {
+    const store = getStaticStore();
+    const ident = String(params.p_identifier || '').trim();
+    if (!ident) return { data: [], error: null };
+    if (ident.includes('@')) {
+      const p = store.profiles.find(x => x.email.toLowerCase() === ident.toLowerCase());
+      return { data: p ? [{ email: p.email, role: p.role }] : [], error: null };
+    }
+    const stu = store.students.find(s => s.student_id.toUpperCase() === ident.toUpperCase());
+    if (stu) {
+      const p = store.profiles.find(x => x.id === stu.profile_id);
+      return { data: p ? [{ email: p.email, role: p.role }] : [], error: null };
+    }
+    const fac = store.faculty.find(f => f.faculty_id.toUpperCase() === ident.toUpperCase());
+    if (fac) {
+      const p = store.profiles.find(x => x.id === fac.profile_id);
+      return { data: p ? [{ email: p.email, role: p.role }] : [], error: null };
+    }
+    return { data: [], error: null };
+  }
+
+  function executeStaticSignUp({ email, password, options = {} }) {
+    const store = getStaticStore();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (store.auth_users.some(u => u.email.toLowerCase() === cleanEmail)) {
+      return {
+        data: { user: null, session: null },
+        error: { status: 422, code: 'user_already_exists', message: 'This email address is already registered. Please sign in instead.' }
+      };
+    }
+    const newAuthUser = {
+      id: generateUuid(),
+      email: cleanEmail,
+      verifier: encodeVerifier(String(password || '')),
+      raw_user_meta_data: { ...(options.data || {}), role: 'student' },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    store.auth_users.push(newAuthUser);
+    persistStaticStore();
+    const session = makeStaticSession(newAuthUser);
+    saveStoredSession(session, false);
+    notifyAuthListeners('SIGNED_IN', session);
+    return { data: { user: session.user, session }, error: null };
+  }
+
+  function executeStaticSignIn({ email, password, rememberMe = true }) {
+    const store = getStaticStore();
+    const authUser = store.auth_users.find(u => u.email.toLowerCase() === String(email || '').trim().toLowerCase());
+    if (!authUser || authUser.verifier !== encodeVerifier(String(password || ''))) {
+      return {
+        data: { user: null, session: null },
+        error: { status: 400, code: 'invalid_credentials', message: 'Invalid ID or password.' }
+      };
+    }
+    const session = makeStaticSession(authUser);
+    saveStoredSession(session, rememberMe);
+    notifyAuthListeners('SIGNED_IN', session);
+    return { data: { user: session.user, session }, error: null };
+  }
+
+  function executeStaticDemoSignIn(presetKey, rememberMe = false) {
+    const presetEmails = {
+      student1: 'princekumar.sharma@mitmumbai.edu.in',
+      student2: 'ananya.kulkarni@mitmumbai.edu.in',
+      faculty1: 'rajeshwari.deshmukh@mitmumbai.edu.in'
+    };
+    const targetEmail = presetEmails[presetKey];
+    const store = getStaticStore();
+    const authUser = store.auth_users.find(u => u.email.toLowerCase() === String(targetEmail || '').toLowerCase());
+    if (!authUser) return { data: null, error: { message: 'Demo preset unavailable.' } };
+    const session = makeStaticSession(authUser);
+    saveStoredSession(session, rememberMe);
+    notifyAuthListeners('SIGNED_IN', session);
+    return { data: { user: session.user, session }, error: null };
+  }
+
   const supabaseClient = {
     supabaseUrl: SUPABASE_URL,
     auth: {
       async signUp({ email, password, options = {} }) {
+        if (IS_STATIC_PAGES_HOST) {
+          return executeStaticSignUp({ email, password, options });
+        }
         try {
           const response = await fetch(`${SUPABASE_URL}/auth/v1/signup`, {
             method: 'POST',
@@ -1156,25 +1245,7 @@
             })
           });
           if (response.status === 404 || response.status === 405) {
-            const store = getStaticStore();
-            const cleanEmail = String(email || '').trim().toLowerCase();
-            if (store.auth_users.some(u => u.email.toLowerCase() === cleanEmail)) {
-              return { data: { user: null, session: null }, error: { status: 422, code: 'user_already_exists', message: 'This email address is already registered. Please sign in instead.' } };
-            }
-            const newAuthUser = {
-              id: generateUuid(),
-              email: cleanEmail,
-              verifier: encodeVerifier(String(password || '')),
-              raw_user_meta_data: { ...(options.data || {}), role: 'student' },
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString()
-            };
-            store.auth_users.push(newAuthUser);
-            persistStaticStore();
-            const session = makeStaticSession(newAuthUser);
-            saveStoredSession(session, false);
-            notifyAuthListeners('SIGNED_IN', session);
-            return { data: { user: session.user, session }, error: null };
+            return executeStaticSignUp({ email, password, options });
           }
 
           const payload = await response.json().catch(() => ({}));
@@ -1213,6 +1284,9 @@
       },
 
       async signInWithPassword({ email, password, rememberMe = true }) {
+        if (IS_STATIC_PAGES_HOST) {
+          return executeStaticSignIn({ email, password, rememberMe });
+        }
         try {
           const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
             method: 'POST',
@@ -1220,15 +1294,7 @@
             body: JSON.stringify({ email, password })
           });
           if (response.status === 404 || response.status === 405) {
-            const store = getStaticStore();
-            const authUser = store.auth_users.find(u => u.email.toLowerCase() === String(email || '').trim().toLowerCase());
-            if (!authUser || authUser.verifier !== encodeVerifier(String(password || ''))) {
-              return { data: { user: null, session: null }, error: { status: 400, code: 'invalid_credentials', message: 'Invalid ID or password.' } };
-            }
-            const session = makeStaticSession(authUser);
-            saveStoredSession(session, rememberMe);
-            notifyAuthListeners('SIGNED_IN', session);
-            return { data: { user: session.user, session }, error: null };
+            return executeStaticSignIn({ email, password, rememberMe });
           }
 
           const payload = await response.json().catch(() => ({}));
@@ -1262,6 +1328,9 @@
       },
 
       async signInWithDemoPreset(presetKey, rememberMe = false) {
+        if (IS_STATIC_PAGES_HOST) {
+          return executeStaticDemoSignIn(presetKey, rememberMe);
+        }
         try {
           const response = await fetch(`${SUPABASE_URL}/auth/v1/demo-session`, {
             method: 'POST',
@@ -1269,19 +1338,7 @@
             body: JSON.stringify({ preset: presetKey })
           });
           if (response.status === 404 || response.status === 405) {
-            const presetEmails = {
-              student1: 'princekumar.sharma@mitmumbai.edu.in',
-              student2: 'ananya.kulkarni@mitmumbai.edu.in',
-              faculty1: 'rajeshwari.deshmukh@mitmumbai.edu.in'
-            };
-            const targetEmail = presetEmails[presetKey];
-            const store = getStaticStore();
-            const authUser = store.auth_users.find(u => u.email.toLowerCase() === String(targetEmail || '').toLowerCase());
-            if (!authUser) return { data: null, error: { message: 'Demo preset unavailable.' } };
-            const session = makeStaticSession(authUser);
-            saveStoredSession(session, rememberMe);
-            notifyAuthListeners('SIGNED_IN', session);
-            return { data: { user: session.user, session }, error: null };
+            return executeStaticDemoSignIn(presetKey, rememberMe);
           }
 
           const payload = await response.json().catch(() => ({}));
@@ -1309,7 +1366,7 @@
 
       async signOut() {
         const session = loadStoredSession();
-        if (session) {
+        if (session && !IS_STATIC_PAGES_HOST) {
           try {
             await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
               method: 'POST',
@@ -1331,6 +1388,9 @@
         const session = loadStoredSession();
         if (!session) {
           return { data: { user: null }, error: null };
+        }
+        if (IS_STATIC_PAGES_HOST) {
+          return { data: { user: session.user || null }, error: null };
         }
         try {
           const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
@@ -1377,33 +1437,17 @@
     },
 
     async rpc(fnName, params = {}) {
+      if (IS_STATIC_PAGES_HOST && fnName === 'resolve_institutional_login_email') {
+        return resolveStaticLoginEmail(params);
+      }
       try {
         const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
           method: 'POST',
           headers: buildHeaders(),
           body: JSON.stringify(params)
         });
-        if (response.status === 404 || response.status === 405) {
-          if (fnName === 'resolve_institutional_login_email') {
-            const store = getStaticStore();
-            const ident = String(params.p_identifier || '').trim();
-            if (!ident) return { data: [], error: null };
-            if (ident.includes('@')) {
-              const p = store.profiles.find(x => x.email.toLowerCase() === ident.toLowerCase());
-              return { data: p ? [{ email: p.email, role: p.role }] : [], error: null };
-            }
-            const stu = store.students.find(s => s.student_id.toUpperCase() === ident.toUpperCase());
-            if (stu) {
-              const p = store.profiles.find(x => x.id === stu.profile_id);
-              return { data: p ? [{ email: p.email, role: p.role }] : [], error: null };
-            }
-            const fac = store.faculty.find(f => f.faculty_id.toUpperCase() === ident.toUpperCase());
-            if (fac) {
-              const p = store.profiles.find(x => x.id === fac.profile_id);
-              return { data: p ? [{ email: p.email, role: p.role }] : [], error: null };
-            }
-            return { data: [], error: null };
-          }
+        if ((response.status === 404 || response.status === 405) && fnName === 'resolve_institutional_login_email') {
+          return resolveStaticLoginEmail(params);
         }
         const payload = await response.json().catch(() => null);
         if (!response.ok) {
@@ -1417,6 +1461,9 @@
         }
         return { data: payload, error: null };
       } catch (err) {
+        if (IS_STATIC_PAGES_HOST && fnName === 'resolve_institutional_login_email') {
+          return resolveStaticLoginEmail(params);
+        }
         return {
           data: null,
           error: { status: 0, code: 'NETWORK_ERROR', message: 'Network error during RPC call.' }
