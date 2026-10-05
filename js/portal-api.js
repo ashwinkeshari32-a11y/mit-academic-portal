@@ -313,7 +313,7 @@
       };
     }
 
-    // 4. Create Student record in `students` table
+    // 4. Create Student record in `students` table (no fake academic metrics or personal defaults)
     const currentYear = new Date().getFullYear();
     const { data: createdStudents, error: stuErr } = await sb
       .from('students')
@@ -326,21 +326,19 @@
         semester: regInput.semester,
         academic_year: '2026–27',
         division: regInput.displayDivision,
-        batch: 'B1',
+        batch: regInput.batch || 'B1',
         date_of_birth: regInput.dob,
-        blood_group: 'O+',
-        category: 'Open Merit',
+        blood_group: regInput.bloodGroup || null,
+        category: regInput.category || null,
         phone: regInput.phone,
         enrollment_year: currentYear,
-        advisor_name: 'Dr. Rajeshwari Deshmukh',
-        guardian_name: 'Registered Parent / Guardian',
-        guardian_phone: regInput.phone,
-        address: 'MIT Campus Registered Student Address',
-        sgpa: 8.50,
-        cgpa: 8.50,
-        semester_history: [
-          { sem: regInput.semester, ay: '2026–27', sgpa: 8.50, credits: 19, status: 'Currently Enrolled' }
-        ],
+        advisor_name: regInput.advisor || null,
+        guardian_name: regInput.guardianName || null,
+        guardian_phone: regInput.guardianPhone || null,
+        address: regInput.address || null,
+        sgpa: 0,
+        cgpa: 0,
+        semester_history: [],
         status: 'Active'
       })
       .select('*');
@@ -447,7 +445,7 @@
       });
     });
 
-    // Sort history newest first, and pick diverse recent check-in sessions across subjects
+    // Sort history newest first
     historyItems.sort((a, b) => {
       const dCmp = String(b.date || '').localeCompare(String(a.date || ''));
       if (dCmp !== 0) return dCmp;
@@ -546,7 +544,7 @@
     gradesList.forEach(g => gradesByCode.set(g.code, g));
 
     const combinedSubjects = attData.subjectAttendance.map(subAtt => {
-      const g = gradesByCode.get(subAtt.code) || { int1: 0, int2: 0, endSem: 0, total: 0, grade: 'P' };
+      const g = gradesByCode.get(subAtt.code);
       return {
         subjectId: subAtt.subjectId,
         code: subAtt.code,
@@ -555,11 +553,12 @@
         attended: subAtt.attended,
         total: subAtt.total,
         percentage: subAtt.percentage,
-        int1: g.int1,
-        int2: g.int2,
-        endSem: g.endSem,
-        totalMarks: g.total,
-        grade: g.grade
+        int1: g ? g.int1 : 0,
+        int2: g ? g.int2 : 0,
+        endSem: g ? g.endSem : 0,
+        totalMarks: g ? g.total : 0,
+        grade: g ? g.grade : '—',
+        hasGrade: Boolean(g)
       };
     });
 
@@ -574,7 +573,7 @@
       name: profileObj.name || 'Student',
       initials: profileObj.initials || 'ST',
       email: profileObj.email || '',
-      phone: stuRow.phone || profileObj.phone || '',
+      phone: stuRow.phone || profileObj.phone || '—',
       course: stuRow.course || courseObj.name || 'B.Tech Computer Engineering',
       courseId: stuRow.course_id,
       department: deptObj.name || 'Computer Engineering',
@@ -585,16 +584,17 @@
       batch: stuRow.batch || 'B1',
       dob: formatLongDate(stuRow.date_of_birth),
       dateOfBirth: stuRow.date_of_birth,
-      bloodGroup: stuRow.blood_group || 'O+',
-      category: stuRow.category || 'Open Merit',
-      admissionYear: String(stuRow.enrollment_year || '2024'),
-      advisor: stuRow.advisor_name || 'Dr. Rajeshwari Deshmukh',
-      guardianName: stuRow.guardian_name || 'Parent / Guardian',
-      guardianPhone: stuRow.guardian_phone || stuRow.phone || '',
-      address: stuRow.address || 'MIT Campus',
-      sgpa: Number(stuRow.sgpa || 8.50),
-      cgpa: Number(stuRow.cgpa || 8.50),
+      bloodGroup: stuRow.blood_group || '—',
+      category: stuRow.category || '—',
+      admissionYear: String(stuRow.enrollment_year || new Date().getFullYear()),
+      advisor: stuRow.advisor_name || '—',
+      guardianName: stuRow.guardian_name || '—',
+      guardianPhone: stuRow.guardian_phone || '—',
+      address: stuRow.address || '—',
+      sgpa: stuRow.sgpa !== null && stuRow.sgpa !== undefined ? Number(stuRow.sgpa) : 0,
+      cgpa: stuRow.cgpa !== null && stuRow.cgpa !== undefined ? Number(stuRow.cgpa) : 0,
       semesterHistory: Array.isArray(stuRow.semester_history) ? stuRow.semester_history : [],
+      status: stuRow.status || 'Active',
       subjects: combinedSubjects,
       attendanceHistory: attData.attendanceHistory,
       overallAttendancePct: attData.overallPercentage
@@ -745,34 +745,26 @@
     return data;
   }
 
-  async function getFacultyCohortData() {
-    const user = await getCurrentUser();
-    if (!user || user.role !== 'faculty') {
-      throw new Error('Permission denied: Faculty credentials required.');
-    }
-
+  /**
+   * Queries Supabase for all students joined with their profiles, departments, courses,
+   * attendance records, and grades. Used by Faculty Student Directory, Attendance Register,
+   * and Marks & Grade Sheet.
+   */
+  async function getStudents() {
     const [
-      facListRes,
       studentsRes,
       subjectsRes,
-      enrollRes,
       attRecordsRes,
-      gradesRes,
-      noticesRes,
-      activityRes
+      gradesRes
     ] = await Promise.all([
-      sb.from('faculty').select('*,profiles(*),departments(*)'),
       sb.from('students').select('*,profiles(*),departments(*),courses(*)').order('student_id', { ascending: true }),
       sb.from('subjects').select('*').order('code', { ascending: true }),
-      sb.from('student_subjects').select('*'),
       sb.from('attendance_records').select('*,attendance_sessions(*)'),
-      sb.from('grades').select('*'),
-      sb.from('notices').select('*').order('published_at', { ascending: false }),
-      sb.from('faculty_activity').select('*').order('created_at', { ascending: false }).limit(10)
+      sb.from('grades').select('*')
     ]);
 
     if (studentsRes.error) {
-      throw new Error(sanitizeUserFacingError(studentsRes.error, 'Unable to load student cohort directory.'));
+      throw new Error(sanitizeUserFacingError(studentsRes.error, 'Unable to load student directory. Please try again.'));
     }
 
     const allSubjects = subjectsRes.data || [];
@@ -780,8 +772,9 @@
     const allGrades = gradesRes.data || [];
     const allAttRecords = attRecordsRes.data || [];
 
-    // Build structured student map keyed by student_id (e.g. 'MIT2026001')
+    const studentsList = [];
     const studentsMap = {};
+
     (studentsRes.data || []).forEach(stuRow => {
       const stuAttRecords = allAttRecords.filter(r => r.student_id === stuRow.id);
       const stuGrades = allGrades.filter(g => g.student_id === stuRow.id);
@@ -790,7 +783,7 @@
         const subAtt = stuAttRecords.filter(r => r.attendance_sessions && r.attendance_sessions.subject_id === sub.id);
         const total = subAtt.length;
         const attended = subAtt.filter(r => r.status === 'Present' || r.status === 'Late' || r.status === 'Excused').length;
-        const gRow = stuGrades.find(g => g.subject_id === sub.id) || { internal_1: 0, internal_2: 0, end_sem: 0, total: 0, grade: 'P' };
+        const gRow = stuGrades.find(g => g.subject_id === sub.id);
 
         return {
           subjectId: sub.id,
@@ -799,10 +792,11 @@
           credits: sub.credits,
           attended,
           total,
-          int1: Number(gRow.internal_1 || 0),
-          int2: Number(gRow.internal_2 || 0),
-          endSem: Number(gRow.end_sem || 0),
-          grade: gRow.grade || computeLetterGrade(gRow.total)
+          int1: gRow ? Number(gRow.internal_1 || 0) : 0,
+          int2: gRow ? Number(gRow.internal_2 || 0) : 0,
+          endSem: gRow ? Number(gRow.end_sem || 0) : 0,
+          grade: gRow ? (gRow.grade || computeLetterGrade(gRow.total)) : '—',
+          hasGrade: Boolean(gRow)
         };
       });
 
@@ -823,13 +817,14 @@
         .sort((a, b) => String(b.date).localeCompare(String(a.date)))
         .slice(0, 10);
 
-      studentsMap[stuRow.student_id] = {
+      const studentObj = {
         uuid: stuRow.id,
+        profileId: stuRow.profile_id,
         id: stuRow.student_id,
         name: stuRow.profiles?.name || stuRow.student_id,
         initials: stuRow.profiles?.initials || 'ST',
         email: stuRow.profiles?.email || '',
-        phone: stuRow.phone || stuRow.profiles?.phone || '',
+        phone: stuRow.phone || stuRow.profiles?.phone || '—',
         course: stuRow.course || stuRow.courses?.name || 'B.Tech Computer Engineering',
         department: stuRow.departments?.name || 'Computer Engineering',
         semester: stuRow.semester || 'Semester V',
@@ -837,19 +832,63 @@
         division: stuRow.division || 'Division A',
         batch: stuRow.batch || 'B1',
         dob: formatLongDate(stuRow.date_of_birth),
-        bloodGroup: stuRow.blood_group || 'O+',
-        category: stuRow.category || 'Open Merit',
-        admissionYear: String(stuRow.enrollment_year || '2024'),
-        advisor: stuRow.advisor_name || 'Dr. Rajeshwari Deshmukh',
-        guardianName: stuRow.guardian_name || 'Parent / Guardian',
-        guardianPhone: stuRow.guardian_phone || '',
-        address: stuRow.address || '',
-        sgpa: Number(stuRow.sgpa || 8.50),
-        cgpa: Number(stuRow.cgpa || 8.50),
+        bloodGroup: stuRow.blood_group || '—',
+        category: stuRow.category || '—',
+        admissionYear: String(stuRow.enrollment_year || new Date().getFullYear()),
+        advisor: stuRow.advisor_name || '—',
+        guardianName: stuRow.guardian_name || '—',
+        guardianPhone: stuRow.guardian_phone || '—',
+        address: stuRow.address || '—',
+        sgpa: stuRow.sgpa !== null && stuRow.sgpa !== undefined ? Number(stuRow.sgpa) : 0,
+        cgpa: stuRow.cgpa !== null && stuRow.cgpa !== undefined ? Number(stuRow.cgpa) : 0,
         semesterHistory: Array.isArray(stuRow.semester_history) ? stuRow.semester_history : [],
+        status: stuRow.status || 'Active',
         subjects: subjectsForStu,
         attendanceHistory: historyItems
       };
+
+      studentsList.push(studentObj);
+      studentsMap[stuRow.student_id] = studentObj;
+    });
+
+    if (global.db && typeof global.db === 'object') {
+      global.db.students = studentsMap;
+    }
+
+    return studentsList;
+  }
+
+  /**
+   * Queries Supabase for the Faculty Assigned Student Directory.
+   */
+  async function getFacultyStudents() {
+    return getStudents();
+  }
+
+  async function getFacultyCohortData() {
+    const user = await getCurrentUser();
+    if (!user || user.role !== 'faculty') {
+      throw new Error('Permission denied: Faculty credentials required.');
+    }
+
+    const [
+      facListRes,
+      studentsList,
+      subjectsRes,
+      noticesRes,
+      activityRes
+    ] = await Promise.all([
+      sb.from('faculty').select('*,profiles(*),departments(*)'),
+      getStudents(),
+      sb.from('subjects').select('*').order('code', { ascending: true }),
+      sb.from('notices').select('*').order('published_at', { ascending: false }),
+      sb.from('faculty_activity').select('*').order('created_at', { ascending: false }).limit(10)
+    ]);
+
+    const allSubjects = subjectsRes.data || [];
+    const studentsMap = {};
+    (studentsList || []).forEach(stu => {
+      studentsMap[stu.id] = stu;
     });
 
     const assignedCourses = allSubjects
@@ -1103,13 +1142,14 @@
       .select('*')
       .eq('student_id', stu.id);
 
-    let newSgpa = Number(stu.sgpa || 8.50);
+    let newSgpa = Number(stu.sgpa || 0);
     if (allStuGrades && allStuGrades.length > 0) {
       const avgTotal = allStuGrades.reduce((acc, g) => acc + Number(g.total || 0), 0) / allStuGrades.length;
       newSgpa = Number(Math.min(10, Math.max(4, (avgTotal / 10) + 0.3)).toFixed(2));
+      const newCgpa = stu.cgpa && Number(stu.cgpa) > 0 ? Number(stu.cgpa) : newSgpa;
       await sb
         .from('students')
-        .update({ sgpa: newSgpa, updated_at: new Date().toISOString() })
+        .update({ sgpa: newSgpa, cgpa: newCgpa, updated_at: new Date().toISOString() })
         .eq('id', stu.id);
     }
 
@@ -1130,6 +1170,8 @@
       studentName: stuName
     };
   }
+
+  const saveGrade = saveGrades;
 
   // ==========================================================================
   // 5. WEEKLY TIMETABLE DATA LAYER
@@ -1197,8 +1239,12 @@
   }
 
   async function loadCatalogLookupMaps() {
+    const { data: sessionData } = await sb.auth.getSession();
+    const sessionRole = sessionData?.session?.user?.user_metadata?.role || null;
+    const shouldQueryFaculty = sessionRole !== 'student';
+
     const [facRes, coursesRes, deptsRes, subjectsRes] = await Promise.all([
-      sb.from('faculty').select('*,profiles(*)'),
+      shouldQueryFaculty ? sb.from('faculty').select('*,profiles(*)') : Promise.resolve({ data: [] }),
       sb.from('courses').select('*'),
       sb.from('departments').select('*'),
       sb.from('subjects').select('*')
@@ -1295,6 +1341,8 @@
     const catalogMaps = await loadCatalogLookupMaps();
     return mapTimetableRowFromDB(data, catalogMaps);
   }
+
+  const createTimetable = createTimetableInDB;
 
   /**
    * Inserts or updates a class session entry in `timetable_entries` in PostgreSQL.
@@ -1475,6 +1523,47 @@
     return true;
   }
 
+  // ==========================================================================
+  // 6. SUPABASE REALTIME SUBSCRIPTIONS (Cross-Browser Live Sync)
+  // ==========================================================================
+  let activeRealtimeChannel = null;
+
+  function subscribeToPortalRealtime(handlers = {}) {
+    if (!sb || typeof sb.channel !== 'function') return null;
+    if (activeRealtimeChannel) {
+      sb.removeChannel(activeRealtimeChannel);
+      activeRealtimeChannel = null;
+    }
+
+    const ch = sb.channel('mit-portal-realtime');
+
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'students' }, payload => {
+      if (typeof handlers.onStudentsChange === 'function') handlers.onStudentsChange(payload);
+    });
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, payload => {
+      if (typeof handlers.onStudentsChange === 'function') handlers.onStudentsChange(payload);
+    });
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_records' }, payload => {
+      if (typeof handlers.onAttendanceChange === 'function') handlers.onAttendanceChange(payload);
+    });
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'grades' }, payload => {
+      if (typeof handlers.onGradesChange === 'function') handlers.onGradesChange(payload);
+    });
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'notices' }, payload => {
+      if (typeof handlers.onNoticesChange === 'function') handlers.onNoticesChange(payload);
+    });
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'timetables' }, payload => {
+      if (typeof handlers.onTimetablesChange === 'function') handlers.onTimetablesChange(payload);
+    });
+    ch.on('postgres_changes', { event: '*', schema: 'public', table: 'timetable_entries' }, payload => {
+      if (typeof handlers.onTimetablesChange === 'function') handlers.onTimetablesChange(payload);
+    });
+
+    ch.subscribe();
+    activeRealtimeChannel = ch;
+    return ch;
+  }
+
   // Export clean API surface
   global.PortalAPI = {
     getCurrentUser,
@@ -1482,6 +1571,8 @@
     signOutPortalUser,
     registerStudentAccount,
     getStudentProfile,
+    getStudents,
+    getFacultyStudents,
     getStudentAttendance,
     getStudentGrades,
     getPublishedNotices,
@@ -1492,14 +1583,17 @@
     saveAttendance,
     adjustSubjectAttendanceInDB,
     saveGrades,
+    saveGrade,
     logFacultyActivity,
     getCurrentTimetable,
     getAllTimetablesFromDB,
     createTimetableInDB,
+    createTimetable,
     saveTimetableEntryInDB,
     deleteTimetableEntryFromDB,
     setTimetablePublishStateInDB,
     clearTimetableWeekInDB,
+    subscribeToPortalRealtime,
     sanitizeUserFacingError
   };
 })(typeof window !== 'undefined' ? window : globalThis);

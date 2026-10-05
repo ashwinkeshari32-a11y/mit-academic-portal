@@ -179,7 +179,6 @@ CREATE POLICY "profiles_select_policy"
   TO authenticated
   USING (
     auth_user_id = auth.uid()
-    OR role = 'faculty'
     OR public.current_user_role() = 'faculty'
   );
 
@@ -235,14 +234,14 @@ CREATE POLICY "students_update_faculty"
 
 -- ============================================================================
 -- 6. FACULTY POLICIES
---    - Authenticated users can read faculty records
+--    - Only authenticated faculty can read faculty records (students denied by RLS)
 --    - NO public/student INSERT policy (Faculty accounts cannot be self-registered)
 -- ============================================================================
 DROP POLICY IF EXISTS "faculty_select_authenticated" ON public.faculty;
 CREATE POLICY "faculty_select_authenticated"
   ON public.faculty FOR SELECT
   TO authenticated
-  USING (true);
+  USING (public.current_user_role() = 'faculty');
 
 DROP POLICY IF EXISTS "faculty_update_own" ON public.faculty;
 CREATE POLICY "faculty_update_own"

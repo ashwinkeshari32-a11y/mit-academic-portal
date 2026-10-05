@@ -234,16 +234,16 @@ function initializeDatabase() {
       batch TEXT NOT NULL DEFAULT 'B1',
       roll_no TEXT,
       date_of_birth TEXT,
-      blood_group TEXT NOT NULL DEFAULT 'O+',
-      category TEXT NOT NULL DEFAULT 'Open Merit',
+      blood_group TEXT,
+      category TEXT,
       phone TEXT,
-      enrollment_year INTEGER NOT NULL DEFAULT 2024 CHECK (enrollment_year >= 2000 AND enrollment_year <= 2100),
-      advisor_name TEXT NOT NULL DEFAULT 'Dr. Rajeshwari Deshmukh',
+      enrollment_year INTEGER NOT NULL DEFAULT 2026 CHECK (enrollment_year >= 2000 AND enrollment_year <= 2100),
+      advisor_name TEXT,
       guardian_name TEXT,
       guardian_phone TEXT,
       address TEXT,
-      sgpa REAL NOT NULL DEFAULT 8.50 CHECK (sgpa >= 0.0 AND sgpa <= 10.0),
-      cgpa REAL NOT NULL DEFAULT 8.50 CHECK (cgpa >= 0.0 AND cgpa <= 10.0),
+      sgpa REAL DEFAULT 0.0 CHECK (sgpa IS NULL OR (sgpa >= 0.0 AND sgpa <= 10.0)),
+      cgpa REAL DEFAULT 0.0 CHECK (cgpa IS NULL OR (cgpa >= 0.0 AND cgpa <= 10.0)),
       semester_history TEXT NOT NULL DEFAULT '[]',
       status TEXT NOT NULL DEFAULT 'Active' CHECK (status IN ('Active', 'Inactive', 'Graduated', 'Suspended')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -382,6 +382,53 @@ function initializeDatabase() {
       CHECK (start_time < end_time)
     );
   `);
+
+  // Migrate existing SQLite students table if it was created with NOT NULL on blood_group/advisor_name
+  try {
+    const cols = db.prepare("PRAGMA table_info('students')").all();
+    const bgCol = cols.find(c => c.name === 'blood_group');
+    if (bgCol && bgCol.notnull === 1) {
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE students_migrated (
+          id TEXT PRIMARY KEY,
+          profile_id TEXT NOT NULL UNIQUE REFERENCES profiles(id) ON DELETE CASCADE,
+          student_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          course TEXT NOT NULL,
+          course_id TEXT REFERENCES courses(id) ON DELETE SET NULL,
+          department_id TEXT NOT NULL REFERENCES departments(id) ON DELETE RESTRICT,
+          semester TEXT NOT NULL,
+          academic_year TEXT NOT NULL DEFAULT '2026–27',
+          division TEXT NOT NULL DEFAULT 'A',
+          batch TEXT NOT NULL DEFAULT 'B1',
+          roll_no TEXT,
+          date_of_birth TEXT,
+          blood_group TEXT,
+          category TEXT,
+          phone TEXT,
+          enrollment_year INTEGER NOT NULL DEFAULT 2026 CHECK (enrollment_year >= 2000 AND enrollment_year <= 2100),
+          advisor_name TEXT,
+          guardian_name TEXT,
+          guardian_phone TEXT,
+          address TEXT,
+          sgpa REAL DEFAULT 0.0 CHECK (sgpa IS NULL OR (sgpa >= 0.0 AND sgpa <= 10.0)),
+          cgpa REAL DEFAULT 0.0 CHECK (cgpa IS NULL OR (cgpa >= 0.0 AND cgpa <= 10.0)),
+          semester_history TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'Active' CHECK (status IN ('Active', 'Inactive', 'Graduated', 'Suspended')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO students_migrated SELECT * FROM students;
+        DROP TABLE students;
+        ALTER TABLE students_migrated RENAME TO students;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+    }
+  } catch (e) {
+    try { db.exec('ROLLBACK; PRAGMA foreign_keys = ON;'); } catch (_) {}
+  }
 
   const existingDepts = db.prepare('SELECT COUNT(*) AS cnt FROM departments').get();
   if (existingDepts && existingDepts.cnt > 0) {
@@ -828,7 +875,7 @@ function filterRowsByRlsSelect(table, rows, ctx) {
     case 'profiles':
       if (!ctx.authenticated) return [];
       if (ctx.role === 'faculty') return rows;
-      return rows.filter(r => r.auth_user_id === ctx.authUserId || r.role === 'faculty');
+      return rows.filter(r => r.auth_user_id === ctx.authUserId);
 
     case 'students':
       if (!ctx.authenticated) return [];
@@ -837,7 +884,7 @@ function filterRowsByRlsSelect(table, rows, ctx) {
       return rows.filter(r => r.profile_id === ctx.profile.id);
 
     case 'faculty':
-      if (!ctx.authenticated) return [];
+      if (!ctx.authenticated || ctx.role !== 'faculty') return [];
       return rows;
 
     case 'student_subjects':
@@ -1168,6 +1215,40 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon'
 };
 
+// ============================================================================
+// 5B. SUPABASE REALTIME ENGINE (SSE + CURSOR EVENT STREAM)
+// ============================================================================
+const realtimeClients = new Set();
+const realtimeEventHistory = [];
+let realtimeCursorCounter = Date.now();
+
+function broadcastRealtimeChange(table, eventType, newRow = null, oldRow = null) {
+  realtimeCursorCounter += 1;
+  const payload = {
+    cursor: realtimeCursorCounter,
+    schema: 'public',
+    table,
+    eventType,
+    new: newRow,
+    old: oldRow,
+    commit_timestamp: new Date().toISOString()
+  };
+
+  realtimeEventHistory.push(payload);
+  if (realtimeEventHistory.length > 200) {
+    realtimeEventHistory.shift();
+  }
+
+  const sseData = `data: ${JSON.stringify(payload)}\n\n`;
+  realtimeClients.forEach(clientRes => {
+    try {
+      clientRes.write(sseData);
+    } catch (e) {
+      realtimeClients.delete(clientRes);
+    }
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -1182,6 +1263,47 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsedUrl.pathname;
 
   try {
+    // ------------------------------------------------------------------------
+    // 0. SUPABASE REALTIME ENDPOINTS (/realtime/v1/*)
+    // ------------------------------------------------------------------------
+    if (pathname === '/realtime/v1/stream' && req.method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.write(`: connected cursor=${realtimeCursorCounter}\n\n`);
+      realtimeClients.add(res);
+
+      const heartbeat = setInterval(() => {
+        try {
+          res.write(`: heartbeat ${Date.now()}\n\n`);
+        } catch (e) {
+          clearInterval(heartbeat);
+          realtimeClients.delete(res);
+        }
+      }, 20000);
+
+      req.on('close', () => {
+        clearInterval(heartbeat);
+        realtimeClients.delete(res);
+      });
+      return;
+    }
+
+    if (pathname === '/realtime/v1/events' && req.method === 'GET') {
+      const hasSince = parsedUrl.searchParams.has('since');
+      const since = Number(parsedUrl.searchParams.get('since') || 0);
+      const events = hasSince
+        ? realtimeEventHistory.filter(ev => ev.cursor > since)
+        : [];
+      return sendJson(res, 200, {
+        cursor: realtimeCursorCounter,
+        events
+      });
+    }
+
     // ------------------------------------------------------------------------
     // A. SUPABASE AUTH ENDPOINTS (/auth/v1/*)
     // ------------------------------------------------------------------------
@@ -1423,6 +1545,7 @@ const server = http.createServer(async (req, res) => {
         const body = await readJsonBody(req);
         const items = Array.isArray(body) ? body : [body];
         const insertedRows = [];
+        const rawInsertedForRealtime = [];
 
         db.exec('BEGIN TRANSACTION;');
         try {
@@ -1465,22 +1588,21 @@ const server = http.createServer(async (req, res) => {
 
               const whereClause = conflictCols.map(c => `${c} = ?`).join(' AND ');
               const fetched = db.prepare(`SELECT * FROM ${table} WHERE ${whereClause}`).get(...conflictCols.map(c => dbItem[c]));
-              if (fetched) insertedRows.push(enrichRowRelations(table, normalizeRowTypes(table, fetched), selectParam, ctx));
+              if (fetched) {
+                const normFetched = normalizeRowTypes(table, fetched);
+                rawInsertedForRealtime.push(normFetched);
+                insertedRows.push(enrichRowRelations(table, normFetched, selectParam, ctx));
+              }
             } else {
               const sql = `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`;
               db.prepare(sql).run(...cols.map(c => dbItem[c]));
 
-              // Trigger equivalent from 002_rls_policies.sql: initialize_new_student_enrollment()
-              if (table === 'student_subjects') {
-                db.prepare(`
-                  INSERT INTO grades (id, student_id, subject_id, academic_year, semester, internal_1, internal_2, end_sem, total, grade)
-                  VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 'P')
-                  ON CONFLICT (student_id, subject_id, academic_year, semester) DO NOTHING
-                `).run(crypto.randomUUID(), dbItem.student_id, dbItem.subject_id, dbItem.academic_year || '2026–27', dbItem.semester || 'Semester V');
-              }
-
               const fetched = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(dbItem.id);
-              if (fetched) insertedRows.push(enrichRowRelations(table, normalizeRowTypes(table, fetched), selectParam, ctx));
+              if (fetched) {
+                const normFetched = normalizeRowTypes(table, fetched);
+                rawInsertedForRealtime.push(normFetched);
+                insertedRows.push(enrichRowRelations(table, normFetched, selectParam, ctx));
+              }
             }
           }
           db.exec('COMMIT;');
@@ -1493,6 +1615,10 @@ const server = http.createServer(async (req, res) => {
             details: msg,
             message: msg
           });
+        }
+
+        for (const rtRow of rawInsertedForRealtime) {
+          broadcastRealtimeChange(table, 'INSERT', rtRow, null);
         }
 
         if (wantsSingleObject) {
@@ -1520,9 +1646,11 @@ const server = http.createServer(async (req, res) => {
         }
 
         const updatedRows = [];
+        const realtimeUpdates = [];
         db.exec('BEGIN TRANSACTION;');
         try {
           for (const row of targetRows) {
+            const oldNorm = normalizeRowTypes(table, row);
             const dbPatch = { ...patchBody };
             delete dbPatch.id;
             if (table === 'notices' && typeof dbPatch.published === 'boolean') {
@@ -1538,13 +1666,19 @@ const server = http.createServer(async (req, res) => {
             }
             const refreshed = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(row.id);
             if (refreshed) {
-              updatedRows.push(enrichRowRelations(table, normalizeRowTypes(table, refreshed), selectParam, ctx));
+              const newNorm = normalizeRowTypes(table, refreshed);
+              realtimeUpdates.push({ newRow: newNorm, oldRow: oldNorm });
+              updatedRows.push(enrichRowRelations(table, newNorm, selectParam, ctx));
             }
           }
           db.exec('COMMIT;');
         } catch (dbErr) {
           try { db.exec('ROLLBACK;'); } catch (_) {}
           return sendJson(res, 400, { code: '23514', message: String(dbErr.message) });
+        }
+
+        for (const u of realtimeUpdates) {
+          broadcastRealtimeChange(table, 'UPDATE', u.newRow, u.oldRow);
         }
 
         if (wantsSingleObject) {
@@ -1586,6 +1720,10 @@ const server = http.createServer(async (req, res) => {
           return sendJson(res, 400, { code: '23503', message: String(dbErr.message) });
         }
 
+        for (const delRow of deletedRows) {
+          broadcastRealtimeChange(table, 'DELETE', null, delRow);
+        }
+
         return sendJson(res, 200, deletedRows);
       }
     }
@@ -1615,7 +1753,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (require.main === module) {
-  server.listen(PORT, () => {
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`MIT Academic Portal Supabase Backend + Web Server running at http://localhost:${PORT}`);
   });
 }

@@ -3130,6 +3130,20 @@
       return profile;
     }
 
+    async function getStudents() {
+      const students = await window.PortalAPI.getStudents();
+      if (Array.isArray(students)) {
+        const map = {};
+        students.forEach(s => { map[s.id] = s; });
+        PortalCache.students = map;
+      }
+      return students || [];
+    }
+
+    async function getFacultyStudents() {
+      return await getStudents();
+    }
+
     async function getStudentAttendance(studentUuid) {
       return await window.PortalAPI.getStudentAttendance(studentUuid);
     }
@@ -3146,6 +3160,10 @@
       return notices;
     }
 
+    async function getCurrentTimetable(weekStartISO) {
+      return await window.PortalAPI.getCurrentTimetable(weekStartISO);
+    }
+
     async function saveAttendance(courseCode, sessionDate, marksByStudentCode) {
       return await window.PortalAPI.saveAttendance(courseCode, sessionDate, marksByStudentCode);
     }
@@ -3154,12 +3172,49 @@
       return await window.PortalAPI.saveGrades(studentCode, courseCode, marksPayload);
     }
 
+    async function saveGrade(studentCode, courseCode, marksPayload) {
+      return await window.PortalAPI.saveGrade(studentCode, courseCode, marksPayload);
+    }
+
     async function createNotice(noticePayload) {
       return await window.PortalAPI.createNotice(noticePayload);
     }
 
     async function updateNotice(noticeId, noticePayload) {
       return await window.PortalAPI.updateNotice(noticeId, noticePayload);
+    }
+
+    async function createTimetable(weekStartISO, weekEndISO, status = 'draft') {
+      return await window.PortalAPI.createTimetable(weekStartISO, weekEndISO, status);
+    }
+
+    let _realtimeRefreshTimer = null;
+    function setupPortalRealtimeSubscriptions() {
+      if (!window.PortalAPI || typeof window.PortalAPI.subscribeToPortalRealtime !== 'function') return;
+      const triggerDebouncedRefresh = () => {
+        if (_realtimeRefreshTimer) clearTimeout(_realtimeRefreshTimer);
+        _realtimeRefreshTimer = setTimeout(async () => {
+          const session = getActiveSession();
+          if (!session) return;
+          try {
+            if (session.role === 'faculty' && AppState.currentRoute === 'faculty') {
+              await syncFacultyDataFromBackend();
+              renderFacultyPortal(session.userId);
+            } else if (session.role === 'student' && AppState.currentRoute === 'dashboard') {
+              await syncStudentDataFromBackend();
+              renderStudentPortal(session.userId);
+            }
+          } catch (e) {}
+        }, 250);
+      };
+
+      window.PortalAPI.subscribeToPortalRealtime({
+        onStudentsChange: triggerDebouncedRefresh,
+        onAttendanceChange: triggerDebouncedRefresh,
+        onGradesChange: triggerDebouncedRefresh,
+        onNoticesChange: triggerDebouncedRefresh,
+        onTimetablesChange: triggerDebouncedRefresh
+      });
     }
 
     function setPortalLoadingState(message = '') {
@@ -3716,6 +3771,7 @@
         } else if (matchedUser.role === 'faculty') {
           await syncFacultyDataFromBackend();
         }
+        setupPortalRealtimeSubscriptions();
 
         // Restore button state & clear password input
         submitBtn.disabled = false;
@@ -3784,6 +3840,7 @@
             } else if (verifiedUser.role === 'faculty') {
               await syncFacultyDataFromBackend();
             }
+            setupPortalRealtimeSubscriptions();
           }
         } catch (e) {
           clearSessionStorage();
@@ -3937,6 +3994,14 @@
       if (targetSec) {
         observeRevealElements(targetSec);
       }
+
+      // Fetch fresh student data from Supabase in background so tab always reflects latest Faculty updates
+      try {
+        await syncStudentDataFromBackend();
+        if (AppState.currentRoute === 'dashboard') {
+          renderStudentPortal(session.userId);
+        }
+      } catch (e) {}
     }
 
     function renderPortalHeaderIdentity(role, userRecord) {
@@ -4108,6 +4173,9 @@
       document.getElementById('stu-prof-sub').textContent = `Student ID: ${student.id} · ${student.course} (${student.department})`;
       const profGrid = document.getElementById('stu-profile-details-grid');
       if (profGrid) {
+        const guardianDisplay = student.guardianName && student.guardianName !== '—'
+          ? (student.guardianPhone && student.guardianPhone !== '—' ? `${student.guardianName} (${student.guardianPhone})` : student.guardianName)
+          : '—';
         profGrid.innerHTML = `
           <div class="p-6 sm:p-7 space-y-4 text-xs">
             <div class="border-b border-[#E8E2D9] pb-2.5">
@@ -4144,7 +4212,7 @@
             <div class="divide-y divide-[#EDE8E0]">
               <div class="py-2.5 flex justify-between gap-4"><span class="text-[#6E6760]">Institutional Email</span><strong class="text-[#1F1C1A] font-medium text-right break-all">${student.email}</strong></div>
               <div class="py-2.5 flex justify-between gap-4"><span class="text-[#6E6760]">Mobile Number</span><strong class="text-[#1F1C1A] font-mono font-normal text-right">${student.phone}</strong></div>
-              <div class="py-2.5 flex justify-between gap-4"><span class="text-[#6E6760]">Parent / Guardian</span><strong class="text-[#1F1C1A] font-medium text-right">${student.guardianName} (${student.guardianPhone})</strong></div>
+              <div class="py-2.5 flex justify-between gap-4"><span class="text-[#6E6760]">Parent / Guardian</span><strong class="text-[#1F1C1A] font-medium text-right">${guardianDisplay}</strong></div>
               <div class="py-2.5 flex justify-between gap-4"><span class="text-[#6E6760]">Permanent Address</span><strong class="text-[#1F1C1A] font-medium text-right">${student.address}</strong></div>
             </div>
           </div>
@@ -4183,19 +4251,24 @@
 
       const attHistTbody = document.getElementById('stu-att-history-tbody');
       if (attHistTbody) {
-        attHistTbody.innerHTML = (student.attendanceHistory || []).map(h => `
-          <tr>
-            <td class="font-mono text-[#6E6760]">${h.date}</td>
-            <td class="font-mono font-medium text-[#4A1214]">${h.code}</td>
-            <td class="text-[#1F1C1A] font-medium">${h.subject}</td>
-            <td class="text-[#6E6760]">${h.type}</td>
-            <td>
-              <span class="text-xs ${h.status === 'Present' ? 'text-[#1F1C1A]' : 'text-[#4A1214] font-medium'}">
-                ${h.status}
-              </span>
-            </td>
-          </tr>
-        `).join('');
+        const histRows = student.attendanceHistory || [];
+        if (!histRows.length) {
+          attHistTbody.innerHTML = `<tr><td colspan="5" class="py-8 text-center text-[#6E6760]">No attendance sessions have been recorded for your account yet.</td></tr>`;
+        } else {
+          attHistTbody.innerHTML = histRows.map(h => `
+            <tr>
+              <td class="font-mono text-[#6E6760]">${h.date}</td>
+              <td class="font-mono font-medium text-[#4A1214]">${h.code}</td>
+              <td class="text-[#1F1C1A] font-medium">${h.subject}</td>
+              <td class="text-[#6E6760]">${h.type}</td>
+              <td>
+                <span class="text-xs ${h.status === 'Present' ? 'text-[#1F1C1A]' : 'text-[#4A1214] font-medium'}">
+                  ${h.status}
+                </span>
+              </td>
+            </tr>
+          `).join('');
+        }
       }
 
       // MODULE 4: ACADEMIC RECORDS
@@ -4222,22 +4295,27 @@
 
       const semGrid = document.getElementById('stu-rec-semesters-grid');
       if (semGrid) {
-        semGrid.innerHTML = (student.semesterHistory || []).map(sh => `
-          <div class="py-4 px-5 first:pl-0 last:pr-0 space-y-1.5 text-xs">
-            <div class="flex items-center justify-between">
-              <strong class="font-medium text-[#1F1C1A]">${sh.sem}</strong>
-              <span class="text-[10.5px] font-mono text-[#6E6760]">${sh.ay}</span>
-            </div>
-            <div class="flex items-baseline justify-between pt-1">
-              <div>
-                <span class="text-2xl font-serif font-semibold text-[#4A1214]">${sh.sgpa.toFixed(2)}</span>
-                <span class="text-[10.5px] uppercase tracking-wider text-[#6E6760] ml-1">SGPA</span>
+        const semHistory = student.semesterHistory || [];
+        if (!semHistory.length) {
+          semGrid.innerHTML = `<div class="py-6 px-5 text-xs text-[#6E6760] col-span-full">No prior semester records available yet.</div>`;
+        } else {
+          semGrid.innerHTML = semHistory.map(sh => `
+            <div class="py-4 px-5 first:pl-0 last:pr-0 space-y-1.5 text-xs">
+              <div class="flex items-center justify-between">
+                <strong class="font-medium text-[#1F1C1A]">${sh.sem}</strong>
+                <span class="text-[10.5px] font-mono text-[#6E6760]">${sh.ay}</span>
               </div>
-              <span class="text-[11px] font-mono text-[#6E6760]">${sh.credits} Credits</span>
+              <div class="flex items-baseline justify-between pt-1">
+                <div>
+                  <span class="text-2xl font-serif font-semibold text-[#4A1214]">${Number(sh.sgpa || 0).toFixed(2)}</span>
+                  <span class="text-[10.5px] uppercase tracking-wider text-[#6E6760] ml-1">SGPA</span>
+                </div>
+                <span class="text-[11px] font-mono text-[#6E6760]">${sh.credits} Credits</span>
+              </div>
+              <div class="text-[11px] text-[#6E6760]">${sh.status}</div>
             </div>
-            <div class="text-[11px] text-[#6E6760]">${sh.status}</div>
-          </div>
-        `).join('');
+          `).join('');
+        }
       }
 
       // MODULE 5: NOTICES
@@ -4291,10 +4369,10 @@
     // ========================================================
     // 8. FACULTY PORTAL RENDERING & MANAGEMENT ACTIONS
     // ========================================================
-    function setFacultyTab(tabName) {
+    async function setFacultyTab(tabName) {
       const session = getActiveSession();
       if (!session || session.role !== 'faculty') {
-        navigateTo('login');
+        await navigateTo('login');
         return;
       }
 
@@ -4321,6 +4399,14 @@
       if (targetSec) {
         observeRevealElements(targetSec);
       }
+
+      // Always fetch latest cohort data from Supabase when Faculty switches tabs
+      try {
+        await syncFacultyDataFromBackend();
+        if (AppState.currentRoute === 'faculty') {
+          renderFacultyPortal(session.userId);
+        }
+      } catch (e) {}
     }
 
     function renderFacultyPortal(facultyId) {
@@ -4471,16 +4557,15 @@
       renderFacultyNoticesManageList();
     }
 
-    // FACULTY MODULE 2: Student Directory, Search, Filter & Inspect Modal
-    function renderFacultyStudentList() {
-      const db = getPortalDB();
+    // FACULTY MODULE 2: Student Directory, Search, Filter & Inspect Modal (Queries Supabase directly)
+    function renderStudents(allStudentsList) {
       const tbody = document.getElementById('fac-students-tbody');
       if (!tbody) return;
 
       const query = (document.getElementById('fac-student-search')?.value || '').trim().toLowerCase();
       const filter = document.getElementById('fac-student-filter')?.value || 'all';
 
-      const students = Object.values(db.students).filter(stu => {
+      const students = (allStudentsList || []).filter(stu => {
         const matchesQuery = !query ||
           stu.name.toLowerCase().includes(query) ||
           stu.id.toLowerCase().includes(query) ||
@@ -4493,6 +4578,11 @@
         if (filter === 'distinction') return stu.cgpa >= 9.0;
         return true;
       });
+
+      const kpiEl = document.getElementById('fac-kpi-students');
+      if (kpiEl && Array.isArray(allStudentsList)) {
+        kpiEl.textContent = String(allStudentsList.length);
+      }
 
       if (!students.length) {
         tbody.innerHTML = `<tr><td colspan="6" class="py-8 text-center text-[#6E6760]">No matching students found in the cohort directory.</td></tr>`;
@@ -4526,12 +4616,37 @@
       }).join('');
     }
 
-    function openStudentInspectModal(studentId) {
+    async function renderFacultyStudentList() {
+      const tbody = document.getElementById('fac-students-tbody');
+      if (!tbody) return;
+
+      // Render cached students immediately if present while querying fresh list from Supabase
+      const cachedStudents = Object.values(PortalCache.students || {});
+      if (cachedStudents.length > 0) {
+        renderStudents(cachedStudents);
+      } else {
+        tbody.innerHTML = `<tr><td colspan="6" class="py-8 text-center text-[#6E6760] font-mono">Loading student directory...</td></tr>`;
+      }
+
+      try {
+        const students = await getFacultyStudents();
+        renderStudents(students);
+      } catch (err) {
+        if (!Object.keys(PortalCache.students || {}).length) {
+          tbody.innerHTML = `<tr><td colspan="6" class="py-8 text-center text-[#8B1E22]">Unable to load student directory. Please try again.</td></tr>`;
+        }
+      }
+    }
+
+    async function openStudentInspectModal(studentId) {
       const session = getActiveSession();
       if (!session || session.role !== 'faculty') return;
 
-      const db = getPortalDB();
-      const stu = db.students[studentId];
+      let stu = PortalCache.students[studentId];
+      try {
+        const freshProfile = await getStudentProfile(studentId);
+        if (freshProfile) stu = freshProfile;
+      } catch (e) {}
       if (!stu) return;
 
       const modal = document.getElementById('faculty-student-modal');
@@ -4763,7 +4878,7 @@
       const int2 = Math.max(0, Math.min(20, Number(document.getElementById(`grade-int2-${studentId}`)?.value || 0)));
       const endSem = Math.max(0, Math.min(60, Number(document.getElementById(`grade-end-${studentId}`)?.value || 0)));
 
-      setPortalLoadingState('Saving grades...');
+      setPortalLoadingState('Updating marks...');
       try {
         const res = await saveGrades(studentId, courseCode, { int1, int2, endSem });
         await syncFacultyDataFromBackend();
@@ -6712,6 +6827,7 @@
           } else if (activeUser.role === 'faculty') {
             await syncFacultyDataFromBackend();
           }
+          setupPortalRealtimeSubscriptions();
         }
       } catch (e) {
         clearSessionStorage();
