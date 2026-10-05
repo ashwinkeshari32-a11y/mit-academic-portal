@@ -211,6 +211,12 @@ async function runVerification() {
   const noticeTitle = `Dept Seminar Announcement ${uniqueSuffix}`;
   let originalCs501Grade = null;
 
+  // Clean up any leftover test artifacts for nextMonday / attendanceDate before starting
+  db.prepare('DELETE FROM timetable_entries WHERE timetable_id IN (SELECT id FROM timetables WHERE week_start = ?)').run(nextMonday);
+  db.prepare('DELETE FROM timetables WHERE week_start = ?').run(nextMonday);
+  db.prepare('DELETE FROM attendance_records WHERE attendance_session_id IN (SELECT id FROM attendance_sessions WHERE date = ?)').run(attendanceDate);
+  db.prepare('DELETE FROM attendance_sessions WHERE date = ?').run(attendanceDate);
+
   try {
     // ==================================================================
     // TEST 1: Student Registration
@@ -542,7 +548,9 @@ async function runVerification() {
       await facClient.PortalAPI.saveGrades('MIT2026001', 'CS501', originalCs501Grade);
     }
     db.prepare('DELETE FROM notices WHERE title = ?').run(noticeTitle);
+    db.prepare('DELETE FROM attendance_records WHERE attendance_session_id IN (SELECT id FROM attendance_sessions WHERE date = ?)').run(attendanceDate);
     db.prepare('DELETE FROM attendance_sessions WHERE date = ?').run(attendanceDate);
+    db.prepare('DELETE FROM timetable_entries WHERE timetable_id IN (SELECT id FROM timetables WHERE week_start = ?)').run(nextMonday);
     db.prepare('DELETE FROM timetables WHERE week_start = ?').run(nextMonday);
     db.prepare('DELETE FROM auth_users WHERE LOWER(email) = LOWER(?)').run(newStudentEmail);
     db.prepare('DELETE FROM faculty_activity WHERE description LIKE ? OR description LIKE ? OR description LIKE ?').run(
