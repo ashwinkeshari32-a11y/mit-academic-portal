@@ -1,0 +1,13 @@
+{
+  "name": "mit-academic-portal",
+  "version": "1.0.0",
+  "description": "MIT Academic Portal — Full-Stack Student & Faculty Portal with Supabase Auth, PostgREST, Realtime SSE & PostgreSQL/SQLite",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/verify_portal_backend.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
